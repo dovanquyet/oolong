@@ -60,7 +60,8 @@ def launch(
         data = load_dataset("oolongbench/oolong-synth")["test"]
         process_response = synth_process_response
     else:
-        data = load_dataset("oolongbench/oolong-real", "toy_dnd")["test"]
+        # use 'toy_dnd' config to try out the DnD dataset
+        data = load_dataset("oolongbench/oolong-real", "dnd")["test"]
         process_response = dnd_process_response
         # we compute token counts based on the model's tokenizer
         data = compute_context_lengths(data, model)
