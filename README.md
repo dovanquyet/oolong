@@ -10,11 +10,14 @@ set up:
 ```
 pip install -r requirements.txt
 export LITELLM_API_KEY="sk-[your key]"
+export model=""
 ```
 
 inference:
 ```
-python src/eval/eval_script_batched.py --model [modelname] --dataset [synth or real]
+python src/eval/eval_script_batched.py \
+    --model $model \
+    --dataset real  --split validation
 ```
 
 This will run inference with batch size 1; you can set a batch size with `--batch_size`, or pass `--batch_by_context_window` to pass a single example from each context window to seed the cache and then the remainder of examples from that window in a single batch. 

@@ -43,6 +43,7 @@ def interpret_litellm_output(datapoint, model, output, response_processor):
 def launch(
     model,
     dataset,
+    split,
     reasoning_level,
     labels,
     batch_by_context_window,
@@ -57,11 +58,11 @@ def launch(
 
     # download data
     if dataset == "synth":
-        data = load_dataset("oolongbench/oolong-synth")["test"]
+        data = load_dataset("oolongbench/oolong-synth")[split]
         process_response = synth_process_response
     else:
         # use 'toy_dnd' config to try out the DnD dataset
-        data = load_dataset("oolongbench/oolong-real", "dnd")["test"]
+        data = load_dataset("oolongbench/oolong-real", "dnd")[split]
         process_response = dnd_process_response
         # we compute token counts based on the model's tokenizer
         data = compute_context_lengths(data, model)
@@ -347,6 +348,11 @@ if __name__ == "__main__":
         choices=["synth", "real"],
         help="Dataset to use (default: synth)",
     )
+    parser.add_argument(
+        "--split",
+        default="test",
+        help="Split to evaluate the model on",
+    )
 
     parser.add_argument(
         "--reasoning_level",
@@ -407,6 +413,7 @@ if __name__ == "__main__":
     launch(
         args.model,
         args.dataset,
+        args.split,
         args.reasoning_level,
         args.labels,
         args.batch_by_context_window,
