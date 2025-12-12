@@ -1,10 +1,13 @@
 import os
-from itertools import batched
+import jsonlines
 from pathlib import Path
 
-import jsonlines
-import litellm
 from datasets import load_dataset
+from itertools import batched
+from tqdm import tqdm
+import litellm
+# litellm._turn_on_debug()
+
 from eval_helpers import dnd_process_response, synth_process_response
 from utils import compute_context_lengths
 
@@ -52,6 +55,7 @@ def launch(
     min_context_len,
     model_prefix,
     base_url,
+    args
 ):
     split_to_use = "context_window_text"
     api_args = {}
@@ -68,7 +72,7 @@ def launch(
         data = compute_context_lengths(data, model)
 
     results_dir = "results"
-    do_cache = True
+    do_cache = args.enable_api_prompt_cache
     safemodelname = model.split("/")[-1]  # +"-labels"
 
     if labels:
@@ -94,7 +98,7 @@ def launch(
     current_outputs = []
 
     data = data.filter(lambda x: x["context_len"] <= max_context_len)
-    data = data.filter(lambda x: x["context_len"] > min_context_len)
+    data = data.filter(lambda x: x["context_len"] >= min_context_len)
     print(
         f"Evaluating {len(data)} examples for model {model} with context lengths between {min_context_len} and {max_context_len}..."
     )
@@ -123,7 +127,7 @@ def launch(
         print("starting data")
         if batch_by_context_window:
             context_windows = list(set(data["context_window_id"]))
-            for context_window_id in context_windows:
+            for context_window_id in tqdm(context_windows, total=len(context_windows)):
                 this_window_data = data.filter(
                     lambda x: x["context_window_id"] == context_window_id
                 )
@@ -253,7 +257,8 @@ def launch(
                     )
                 current_outputs = []
         else:
-            for batch in batched(data, batch_size):
+            batches = list(batched(data, batch_size))
+            for batch in tqdm(batches, total=len(batches)):
                 client = litellm.batch_completion(
                     api_key=os.environ.get("LITELLM_API_KEY"),
                     base_url=base_url,
@@ -339,7 +344,6 @@ def launch(
 
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -355,17 +359,22 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--reasoning_level",
-        default="",
-        choices=["", "low", "medium", "high", "minimal"],
-        help="Reasoning level (default: empty string)",
-    )
-
-    parser.add_argument(
         "--labels",
         action="store_true",
         default=False,
         help="Enable labels (default: False)",
+    )
+    parser.add_argument(
+        "--max_context_len",
+        default=131072,
+        type=int,
+        help="max context length to include",
+    )
+    parser.add_argument(
+        "--min_context_len",
+        default=8192,
+        type=int,
+        help="min context length to include",
     )
 
     parser.add_argument(
@@ -376,28 +385,29 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--batch_size", default=1, type=int, help="number of examples to run at once"
-    )
-
-    parser.add_argument(
-        "--max_context_len",
-        default=131072,
+        "--batch_size",
+        default=1, 
         type=int,
-        help="max context length to include",
-    )
-
-    parser.add_argument(
-        "--min_context_len",
-        default=1024,
-        type=int,
-        help="min context length to include",
+        help="number of examples to run at once"
     )
 
     parser.add_argument(
         "--model_prefix",
         default="",
         type=str,
-        help="a prefix to append to all models (e.g. 'litellm_proxy/')",
+        help="a prefix to append to all models (e.g. 'litellm_proxy/', 'gemini/', 'hosted_vllm/')",
+    )
+    parser.add_argument(
+        "--model", 
+        required=True,
+        type=str,
+        help="Model name (required)"
+    )
+    parser.add_argument(
+        "--reasoning_level",
+        default="",
+        choices=["", "low", "medium", "high", "minimal", "none", "disabled"],
+        help="Reasoning level (default: empty string)",
     )
     parser.add_argument(
         "--base_url",
@@ -405,11 +415,14 @@ if __name__ == "__main__":
         type=str,
         help="a base URL for a hosted litellm instance, if necessary",
     )
-
-    parser.add_argument("--model", required=True, help="Model name (required)")
+    parser.add_argument(
+        "--enable_api_prompt_cache",
+        action="store_true",
+        default=False,
+        help="Enable API prompt caching (default: False)",
+    )
 
     args = parser.parse_args()
-
     launch(
         args.model,
         args.dataset,
@@ -422,4 +435,5 @@ if __name__ == "__main__":
         args.min_context_len,
         args.model_prefix,
         args.base_url,
+        args
     )

@@ -1,4 +1,19 @@
+# Custom
 src/eval/secret.py
+
+# macOS system files
+*.DS_Store
+
+# Python cache files
+**/__pycache__/
+*.pyc
+
+# VSCode related files
+.vscode/
+
+# Data files
+*.html
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
