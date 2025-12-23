@@ -102,6 +102,7 @@ def launch(
     print(
         f"Evaluating {len(data)} examples for model {model} with context lengths between {min_context_len} and {max_context_len}..."
     )
+    all_considered_ids = list(data["id"])
 
     # potentially init from prior partial run
     full_results_path = f"{results_dir}/{dataset}/{safemodelname}/full_output.jsonl"
@@ -112,12 +113,14 @@ def launch(
         with jsonlines.open(full_results_path, "r") as f:
             for obj in f:
                 ids_to_skip.append(obj["id"])
-                correct += obj["score"]
-                output_counter += 1
-                total_count += 1
+                if obj["id"] in all_considered_ids:
+                    correct += obj["score"]
+                    output_counter += 1
+                    total_count += 1
         data = data.filter(lambda x: x["id"] not in ids_to_skip)
         print(
-            f"Caution: filtered out completed examples; {len(data)} examples left to run..."
+            "Caution: filtered out completed examples;"
+            f"{len(data)} examples left to run..."
         )
     else:
         with jsonlines.open(full_results_path, "w") as f:
