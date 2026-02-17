@@ -24,25 +24,14 @@ export PORT=8000
 
 python src/eval/eval_script_batched.py \
     --model "hosted_vllm/${MODEL}" --reasoning_level low \
-    --dataset synth --split validation \
-    --min_context_len 16384 --max_context_len 16384 \
-    --base_url "http://0.0.0.0:${PORT}/v1" --batch_size 1
+    --dataset synth --split test \
+    --min_context_len 65536 --max_context_len 65536 \
+    --base_url "http://0.0.0.0:${PORT}/v1"
 ```
 
-This will run inference with batch size 1; you can set a batch size with `--batch_size`, or pass `--batch_by_context_window` to pass a single example from each context window to seed the cache and then the remainder of examples from that window in a single batch. 
+This will run inference with a fixed batch size 1.
 
 You can set maximum and minimum input example lengths; Oolong-real will also attempt to infer the maximum input length from the model provided.
-
-## More soon!
-
-Release status:
-- [x] Output scoring scripts for both splits
-- [x] API inference script
-- [ ] Oolong-synth construction code
-- [ ] Validated splits of each Oolong-synth source dataset 
-- [ ] Oolong-real construction code
-- [ ] Full output sets for models from the paper
-- [ ] Analysis scripts
 
 
 ## BibTeX

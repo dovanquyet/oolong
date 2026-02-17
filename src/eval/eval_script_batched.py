@@ -1,10 +1,9 @@
-import os
+import os, time
 import jsonlines
 from pathlib import Path
 
-from datasets import load_dataset
-from itertools import batched
 from tqdm import tqdm
+from datasets import load_dataset
 import litellm
 # litellm._turn_on_debug()
 
@@ -12,55 +11,91 @@ from eval_helpers import dnd_process_response, synth_process_response
 from utils import compute_context_lengths
 
 
-def interpret_litellm_output(datapoint, model, output, response_processor):
-    if output == litellm.BadRequestError:
-        this_output = {
-            "id": datapoint["id"],
-            "context_window_id": datapoint["context_window_id"],
-            "dataset": datapoint["dataset"],
-            "model": model,
-            "attempted_parse": "ERROR",
-            "parse_confidence": "ERROR",
-            "full_answer": "ERROR",
-            "score": 0,
-            "context_len": datapoint["context_len"],
-            "task_group": datapoint["task_group"],
-            "task": datapoint["task"],
-            "answer_type": datapoint["answer_type"],
-            "answer": str(datapoint["answer"].strip("[").strip("]")),
-        }
-        print("WARNING:ERROR")
-    else:
-        output = output["choices"][0]["message"]["content"]
-        if output is None:
-            if output["choices"][0]["finish_reason"] == "content_filter":
-                output = "CONTENT_FILTERED"
-                print("WARNING: CONTENT FILTERED")
-            else:
-                raise ValueError("empty output!")
-        this_output = response_processor(datapoint, output, model)
 
-    return this_output
+def llm_call(args, datapoint, split_to_use, response_processor, api_kwargs, 
+             cache_control={"cache_control": {"type": "ephemeral"}}, max_retries=3):
+    """
+    Make an LLM call and interpret the output with automatic retry on parsing errors.
+    
+    Args:
+        args: Arguments including base_url and model
+        datapoint: The data point to process
+        split_to_use: The key for the context text in the datapoint
+        response_processor: Function to process the response
+        api_kwargs: Additional API arguments
+        cache_control: Dictionary to control caching behavior for the LLM call (default: ephemeral)
+        max_retries: Maximum number of retries on error
+    
+    Returns:
+        Processed output dictionary
+    """
+    for attempt in range(max_retries):
+        try:
+            response = litellm.completion(
+                api_key=os.environ.get("LITELLM_API_KEY"),
+                base_url=args.base_url,
+                tools=[],
+                model=args.model,
+                # api_version="2024-12-01",
+                # extra_headers={"anthropic-beta": "context-1m-2025-08-07"},
+                messages=[
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "You are a helpful assistant."},
+                        {"type": "text", "text": f"{datapoint[split_to_use]}", **cache_control},
+                    ]},
+                    {"role": "user", "content": f"{datapoint['question']}"},
+                ],
+                **api_kwargs,
+            )
+            
+            # Process the response
+            output = response["choices"][0]["message"]["content"]
+            if output is None:
+                if response["choices"][0]["finish_reason"] == "content_filter":
+                    output = "CONTENT_FILTERED"
+                    print("WARNING: CONTENT FILTERED")
+                else:
+                    raise ValueError("empty output!")
+            
+            return response_processor(datapoint, output, args.model)
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(
+                    "Error during LLM call for datapoint "
+                    f"{datapoint['id']} (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                time.sleep(3 ** (attempt+1))  # Exponential backoff
+            else:
+                print(f"Final error after {max_retries} attempts for datapoint {datapoint['id']}: {e}")
+                return {
+                    "id": datapoint["id"],
+                    "context_window_id": datapoint["context_window_id"],
+                    "dataset": datapoint["dataset"],
+                    "model": args.model,
+                    "attempted_parse": "ERROR",
+                    "parse_confidence": "ERROR",
+                    "full_answer": "ERROR",
+                    "score": 0,
+                    "context_len": datapoint["context_len"],
+                    "task_group": datapoint["task_group"],
+                    "task": datapoint["task"],
+                    "answer_type": datapoint["answer_type"],
+                    "answer": str(datapoint["answer"].strip("[").strip("]")),
+                }
 
 
 def launch(
-    model,
     dataset,
     split,
-    reasoning_level,
     labels,
-    batch_by_context_window,
-    batch_size,
     max_context_len,
     min_context_len,
-    model_prefix,
-    base_url,
+    model,
+    reasoning_level,
     args
 ):
-    split_to_use = "context_window_text"
-    api_args = {}
-
-    # download data
+    # download, filter, and sort data
     if dataset == "synth":
         data = load_dataset("oolongbench/oolong-synth")[split]
         process_response = synth_process_response
@@ -71,9 +106,19 @@ def launch(
         # we compute token counts based on the model's tokenizer
         data = compute_context_lengths(data, model)
 
+    data = data.filter(lambda x: x["context_len"] <= max_context_len)
+    data = data.filter(lambda x: x["context_len"] >= min_context_len)
+    print(
+        f"Evaluating {len(data)} examples for model {model} "
+        f"with context lengths between {min_context_len} and {max_context_len}..."
+    )
+    data = data.sort("context_window_id") # sort by context window ID to enable caching
+
+    # config i/o
     results_dir = "results"
-    do_cache = args.enable_api_prompt_cache
     safemodelname = model.split("/")[-1]  # +"-labels"
+    split_to_use = "context_window_text"
+    api_kwargs = {}
 
     if labels:
         safemodelname += "-labels"
@@ -81,274 +126,67 @@ def launch(
 
     if reasoning_level != "":
         safemodelname += f"-{reasoning_level}"
-        api_args["reasoning_effort"] = reasoning_level
-        api_args["extra_body"] = {"allowed_openai_params": ["reasoning_effort"]}
+        api_kwargs["reasoning_effort"] = reasoning_level
+        api_kwargs["extra_body"] = {"allowed_openai_params": ["reasoning_effort"]}
 
     Path(f"{results_dir}/{dataset}/{safemodelname}").mkdir(parents=True, exist_ok=True)
+    full_results_path = f"{results_dir}/{dataset}/{safemodelname}/full_output.jsonl"
 
-    # sort by context window ID (to enable caching)
-    data = data.sort("context_window_id")
-
-    # for each example:
+    # init stats
     output_counter = 0
     correct = 0
-    total_count = 0
-
-    all_outputs = []
-    current_outputs = []
-
-    data = data.filter(lambda x: x["context_len"] <= max_context_len)
-    data = data.filter(lambda x: x["context_len"] >= min_context_len)
-    print(
-        f"Evaluating {len(data)} examples for model {model} with context lengths between {min_context_len} and {max_context_len}..."
-    )
     all_considered_ids = list(data["id"])
+    total_count = len(all_considered_ids)
 
     # potentially init from prior partial run
-    full_results_path = f"{results_dir}/{dataset}/{safemodelname}/full_output.jsonl"
     if os.path.exists(full_results_path):
         ids_to_skip = []
         correct = 0
         output_counter = 0
+
         with jsonlines.open(full_results_path, "r") as f:
             for obj in f:
                 ids_to_skip.append(obj["id"])
                 if obj["id"] in all_considered_ids:
                     correct += obj["score"]
                     output_counter += 1
-                    total_count += 1
+
         data = data.filter(lambda x: x["id"] not in ids_to_skip)
         print(
-            "Caution: filtered out completed examples;"
+            "Caution: filtered out completed examples; "
             f"{len(data)} examples left to run..."
         )
+
     else:
         with jsonlines.open(full_results_path, "w") as f:
             pass  # init file
 
-    try:
-        print("starting data")
-        if batch_by_context_window:
-            context_windows = list(set(data["context_window_id"]))
-            for context_window_id in tqdm(context_windows, total=len(context_windows)):
-                this_window_data = data.filter(
-                    lambda x: x["context_window_id"] == context_window_id
-                )
+    fout_full_output = jsonlines.open(full_results_path, "a")
+    for datapoint in tqdm(data, desc="Evaluating examples", total=len(data)):
+        try:
+            this_output = llm_call(
+                args, datapoint, split_to_use, process_response, api_kwargs,
+            )
+            correct += this_output["score"]
+            output_counter += 1
+            fout_full_output.write(this_output)
+            print(f"Score so far: {correct / output_counter:.4f} ({output_counter} examples)")
 
-                if do_cache:
-                    # run one through, then run the remainder as a batch
-                    seed_datapoint = this_window_data[0]
+        except Exception as e:
+            print(f"Error on datapoint {datapoint['id']}, which is item {output_counter}: {e}")
 
-                    datapoint = seed_datapoint
-                    client = litellm.completion(
-                        api_key=os.environ.get("LITELLM_API_KEY"),
-                        base_url=base_url,
-                        tools=[],
-                        model=f"{model_prefix}{model}",
-                        api_version="2024-12-01",
-                        extra_headers={"anthropic-beta": "context-1m-2025-08-07"},
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "You are a helpful assistant.",
-                                    },
-                                    {
-                                        "type": "text",
-                                        "text": f"{seed_datapoint[split_to_use]}",
-                                        "cache_control": {"type": "ephemeral"},
-                                    },
-                                ],
-                            },
-                            {
-                                "role": "user",
-                                "content": f"{seed_datapoint['question']}",
-                            },
-                        ],
-                        **api_args,
-                    )
-
-                    this_output = interpret_litellm_output(
-                        datapoint, model, client, process_response
-                    )
-
-                    all_outputs.append(this_output)
-                    current_outputs.append(this_output)
-
-                    correct += this_output["score"]
-                    output_counter += 1
-
-                    # now batch the rest
-                    # convert the dictionary of lists to a list of dictionaries
-                    # fancy pythonic way to do this: https://stackoverflow.com/questions/5558418/list-of-dicts-to-from-dict-of-lists
-                    remaining_window_examples = [
-                        dict(zip(this_window_data[1:], t))
-                        for t in zip(*this_window_data[1:].values())
-                    ]
-                    print(
-                        f"Cache call done. Running {len(remaining_window_examples)} more examples as a single batch..."
-                    )
-
-                else:
-                    # all examples are remaining
-                    remaining_window_examples = [
-                        dict(zip(this_window_data[0:], t))
-                        for t in zip(*this_window_data[1:].values())
-                    ]
-                    print(
-                        f"Running window with {len(remaining_window_examples)} examples..."
-                    )
-
-                client = litellm.batch_completion(
-                    api_key=os.environ.get("LITELLM_API_KEY"),
-                    base_url=base_url,
-                    model=f"{model_prefix}{model}",
-                    extra_headers={"anthropic-beta": "context-1m-2025-08-07"},
-                    # max_completion_tokens=32768,
-                    tools=[],
-                    messages=[
-                        [
-                            {
-                                "role": "system",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "You are a helpful assistant.",
-                                    },
-                                    {
-                                        "type": "text",
-                                        "text": f"{datapoint[split_to_use]}",
-                                        # "cache_control": {"type": "ephemeral"},
-                                    },
-                                ],
-                            },
-                            {
-                                "role": "user",
-                                "content": f"{datapoint['question']}",
-                            },
-                        ]
-                        for datapoint in remaining_window_examples
-                    ],
-                    **api_args,
-                )
-                for count, datapoint in enumerate(remaining_window_examples):
-                    this_output = interpret_litellm_output(
-                        datapoint, model, client[count], process_response
-                    )
-                    correct += this_output["score"]
-                    output_counter += 1
-                    all_outputs.append(this_output)
-                    current_outputs.append(this_output)
-
-                # save partial and full output for this batch
-
-                with jsonlines.open(
-                    f"{results_dir}/{dataset}/{safemodelname}/full_output.jsonl", "a"
-                ) as f:
-                    for line in current_outputs:
-                        f.write(line)
-                with jsonlines.open(
-                    f"{results_dir}/{dataset}/{safemodelname}/partial_output_{output_counter - len(this_window_data)}_{output_counter - 1}.jsonl",
-                    "w",
-                ) as f:
-                    for line in current_outputs:
-                        f.write(line)
-                    print(
-                        f"score so far: {correct / output_counter:.4f} ({output_counter} examples)"
-                    )
-                current_outputs = []
-        else:
-            batches = list(batched(data, batch_size))
-            for batch in tqdm(batches, total=len(batches)):
-                client = litellm.batch_completion(
-                    api_key=os.environ.get("LITELLM_API_KEY"),
-                    base_url=base_url,
-                    extra_headers={"anthropic-beta": "context-1m-2025-08-07"},
-                    model=f"{model_prefix}{model}",
-                    tools=[],
-                    messages=[
-                        [
-                            {
-                                "role": "system",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "You are a helpful assistant.",
-                                    },
-                                    {
-                                        "type": "text",
-                                        "text": f"{datapoint[split_to_use]}",
-                                        "cache_control": {"type": "ephemeral"},
-                                    },
-                                ],
-                            },
-                            {
-                                "role": "user",
-                                "content": f"{datapoint['question']}",
-                            },
-                        ]
-                        for datapoint in batch
-                    ],
-                    **api_args,
-                )
-                for count, datapoint in enumerate(batch):
-                    this_output = interpret_litellm_output(
-                        datapoint, model, client[count], process_response
-                    )
-                    correct += this_output["score"]
-                    output_counter += 1
-                    all_outputs.append(this_output)
-                    current_outputs.append(this_output)
-                # save partial and full output for this batch
-
-                with jsonlines.open(
-                    f"{results_dir}/{dataset}/{safemodelname}/full_output.jsonl", "a"
-                ) as f:
-                    for line in current_outputs:
-                        f.write(line)
-                with jsonlines.open(
-                    f"{results_dir}/{dataset}/{safemodelname}/partial_output_{output_counter - len(batch)}_{output_counter - 1}.jsonl",
-                    "w",
-                ) as f:
-                    for line in current_outputs:
-                        f.write(line)
-                    print(
-                        f"score so far: {correct / output_counter:.4f} ({output_counter} examples)"
-                    )
-                current_outputs = []
-
-    except Exception as e:
-        error_file_loc = (
-            f"{results_dir}/{dataset}/{safemodelname}/error_partial_results.jsonl"
-        )
-        with jsonlines.open(error_file_loc, "w") as f:
-            for line in all_outputs:
-                f.write(line)
-
-        print(client)
-        raise ValueError(
-            f"Error on datapoint {datapoint['id']}, which is item {output_counter}. Saved partial results to {error_file_loc}. Error: {e}"
-        )
-
-    with jsonlines.open(
-        f"{results_dir}/{dataset}/{safemodelname}/full_output.jsonl", "a"
-    ) as f:
-        for line in current_outputs:
-            f.write(line)
-
-    total_count += len(data)
     with open(f"{results_dir}/{dataset}/{safemodelname}/overall.txt", "w") as f:
-        summary = f"Overall score for {model} on {total_count} examples: {correct}/{total_count} = {correct / total_count}"
+        summary = f"Overall score for {model} on {total_count} examples:" + \
+                  f"{correct}/{total_count} = {correct / total_count}"
         f.write(summary)
         print(summary)
 
 
-if __name__ == "__main__":
+def parse_args():
     import argparse
     parser = argparse.ArgumentParser()
 
+    # dataset config
     parser.add_argument(
         "--dataset",
         default="synth",
@@ -360,7 +198,6 @@ if __name__ == "__main__":
         default="test",
         help="Split to evaluate the model on",
     )
-
     parser.add_argument(
         "--labels",
         action="store_true",
@@ -380,31 +217,13 @@ if __name__ == "__main__":
         help="min context length to include",
     )
 
-    parser.add_argument(
-        "--batch_by_context_window",
-        action="store_true",
-        default=False,
-        help="Enable batching by context window (default: False)",
-    )
-
-    parser.add_argument(
-        "--batch_size",
-        default=1, 
-        type=int,
-        help="number of examples to run at once"
-    )
-
-    parser.add_argument(
-        "--model_prefix",
-        default="",
-        type=str,
-        help="a prefix to append to all models (e.g. 'litellm_proxy/', 'gemini/', 'hosted_vllm/')",
-    )
+    # model config
     parser.add_argument(
         "--model", 
         required=True,
         type=str,
-        help="Model name (required)"
+        help="Model name with a router prefix if necessary"
+        "(e.g. 'litellm_proxy/gpt-4o', 'gemini/gemini-3-pro-preview', 'hosted_vllm/gpt-oss-20b')"
     )
     parser.add_argument(
         "--reasoning_level",
@@ -418,25 +237,21 @@ if __name__ == "__main__":
         type=str,
         help="a base URL for a hosted litellm instance, if necessary",
     )
-    parser.add_argument(
-        "--enable_api_prompt_cache",
-        action="store_true",
-        default=False,
-        help="Enable API prompt caching (default: False)",
-    )
 
     args = parser.parse_args()
+    return args
+
+
+
+if __name__ == "__main__":
+    args = parse_args()
     launch(
-        args.model,
         args.dataset,
         args.split,
-        args.reasoning_level,
         args.labels,
-        args.batch_by_context_window,
-        args.batch_size,
         args.max_context_len,
         args.min_context_len,
-        args.model_prefix,
-        args.base_url,
+        args.model,
+        args.reasoning_level,
         args
     )
